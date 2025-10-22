@@ -48,12 +48,12 @@ struct AzureMessageResponse {
 
 impl AzureOpenAIClient {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let endpoint = env::var("AZURE_OPENAI_ENDPOINT")?;
-        let api_key = env::var("AZURE_OPENAI_KEY")?;
-        let deployment = env::var("AZURE_OPENAI_DEPLOYMENT")?;
-        let api_version = env::var("AZURE_OPENAI_API_VERSION")
-            .unwrap_or_else(|_| "2024-08-01-preview".to_string());
-        
+        let endpoint = env::var("LLM_URL")?;
+        let api_key = env::var("LLM_KEY")?;
+        let deployment = env::var("LLM_MODEL")?;
+        let api_version =
+            env::var("LLM_VERSION").unwrap_or_else(|_| "2024-08-01-preview".to_string());
+
         Ok(Self {
             client: Client::new(),
             endpoint,
@@ -76,7 +76,7 @@ impl LLMProvider for AzureOpenAIClient {
             self.deployment,
             self.api_version
         );
-        
+
         let request_body = AzureRequest {
             messages: vec![AzureMessage {
                 role: "user".to_string(),
@@ -85,7 +85,7 @@ impl LLMProvider for AzureOpenAIClient {
             max_tokens: 4096,
             temperature: 0.7,
         };
-        
+
         let response = self
             .client
             .post(&url)
@@ -94,15 +94,15 @@ impl LLMProvider for AzureOpenAIClient {
             .json(&request_body)
             .send()
             .await?;
-        
+
         let azure_response: AzureResponse = response.json().await?;
-        
+
         let content = azure_response
             .choices
             .first()
             .map(|c| c.message.content.clone())
             .unwrap_or_default();
-        
+
         Ok(serde_json::json!(content))
     }
 }
