@@ -16,7 +16,7 @@ use crate::llm::LLMProvider;
 struct TPMLimiter {
     max_tpm: u32,
     min_interval: Duration,
-    token_usage: VecDeque<(SystemTime, u32)>, // (timestamp, tokens)
+    token_usage: VecDeque<(SystemTime, u32)>,
     last_request: Option<SystemTime>,
     total_tokens_used: u32,
 }
@@ -32,22 +32,6 @@ impl TPMLimiter {
         }
     }
 
-    fn print_progress_bar(&self, percentage: f32, elapsed: Duration, total: Duration) {
-        let bar_width = 30;
-        let filled = (bar_width as f32 * percentage / 100.0) as usize;
-        let empty = bar_width - filled;
-
-        print!(
-            "\r│ [{}{}] {:>5.1}% │ {:>4.1}s / {:>4.1}s remaining │",
-            "█".repeat(filled),
-            "░".repeat(empty),
-            percentage,
-            elapsed.as_secs_f32(),
-            total.as_secs_f32()
-        );
-        io::stdout().flush().ok();
-    }
-
     fn get_current_tpm(&self) -> u32 {
         let now = SystemTime::now();
         let one_minute_ago = now - Duration::from_secs(60);
@@ -57,31 +41,6 @@ impl TPMLimiter {
             .filter(|(time, _)| *time >= one_minute_ago)
             .map(|(_, tokens)| tokens)
             .sum()
-    }
-
-    fn print_tpm_status(&self) {
-        let current_tpm = self.get_current_tpm();
-        let percentage = (current_tpm as f32 / self.max_tpm as f32 * 100.0).min(100.0);
-        let bar_width = 30;
-        let filled = (bar_width as f32 * percentage / 100.0) as usize;
-
-        println!("┌─────────────────────────────────────────────────────────────┐");
-        println!("│ TPM STATUS                                                  │");
-        println!("├─────────────────────────────────────────────────────────────┤");
-        println!(
-            "│ Current Usage: {:>6} / {:>6} tokens ({:>5.1}%)            │",
-            current_tpm, self.max_tpm, percentage
-        );
-        println!(
-            "│ [{}{}] │",
-            "█".repeat(filled),
-            "░".repeat(bar_width - filled)
-        );
-        println!(
-            "│ Total Tokens:  {:>6} tokens                               │",
-            self.total_tokens_used
-        );
-        println!("└─────────────────────────────────────────────────────────────┘");
     }
 
     fn add_token_usage(&mut self, tokens: u32) {
@@ -108,24 +67,11 @@ impl TPMLimiter {
             if let Ok(elapsed) = last_req.elapsed() {
                 if elapsed < self.min_interval {
                     let wait_time = self.min_interval - elapsed;
-                    println!("┌─────────────────────────────────────────────────────────────┐");
                     println!(
-                        "│ RATE LIMIT: Minimum {} second interval                     │",
+                        "[RATE LIMIT] Minimum {} second interval",
                         self.min_interval.as_secs()
                     );
-                    println!("└─────────────────────────────────────────────────────────────┘");
-
-                    // Progress bar for minimum interval wait
-                    let start = SystemTime::now();
-                    while start.elapsed().unwrap() < wait_time {
-                        let elapsed = start.elapsed().unwrap();
-                        let percentage = (elapsed.as_secs_f32() / wait_time.as_secs_f32()) * 100.0;
-                        let remaining = wait_time - elapsed;
-                        self.print_progress_bar(percentage, elapsed, remaining);
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    self.print_progress_bar(100.0, wait_time, Duration::from_secs(0));
-                    println!();
+                    thread::sleep(wait_time);
                 }
             }
         }
@@ -140,25 +86,11 @@ impl TPMLimiter {
                     if elapsed < Duration::from_secs(60) {
                         let wait_time =
                             Duration::from_secs(60) - elapsed + Duration::from_millis(100);
-                        println!("┌─────────────────────────────────────────────────────────────┐");
                         println!(
-                            "│ TPM LIMIT REACHED: {}/{} tokens                          │",
+                            "[TPM LIMIT] {}/{} tokens, waiting...",
                             current_tpm, self.max_tpm
                         );
-                        println!("│ Waiting for token window to refresh...                     │");
-                        println!("└─────────────────────────────────────────────────────────────┘");
-
-                        let start = SystemTime::now();
-                        while start.elapsed().unwrap() < wait_time {
-                            let elapsed = start.elapsed().unwrap();
-                            let percentage =
-                                (elapsed.as_secs_f32() / wait_time.as_secs_f32()) * 100.0;
-                            let remaining = wait_time - elapsed;
-                            self.print_progress_bar(percentage, elapsed, remaining);
-                            thread::sleep(Duration::from_millis(100));
-                        }
-                        self.print_progress_bar(100.0, wait_time, Duration::from_secs(0));
-                        println!();
+                        thread::sleep(wait_time);
                     }
                 }
             }
@@ -169,7 +101,6 @@ impl TPMLimiter {
 }
 
 fn count_tokens(text: &str) -> u32 {
-    // Simple approximation: ~4 chars per token
     (text.len() / 4) as u32
 }
 
@@ -185,26 +116,14 @@ fn filter_thinking_tokens(text: &str) -> String {
 async fn main() {
     dotenv().ok();
 
-    // Clear screen and print header
-    print!("\x1B[2J\x1B[1;1H");
-    println!("╔═════════════════════════════════════════════════════════════╗");
-    println!("║          RUST CODE AGENT - LLM Powered Automation          ║");
-    println!("╚═════════════════════════════════════════════════════════════╝");
+    println!("=== RUST CODE AGENT ===");
     println!();
 
-    let instruction =
-        env::var("INSTRUCTION").expect("Please set the INSTRUCTION variable in your .env file");
-
+    let instruction = env::var("INSTRUCTION").expect("Please set INSTRUCTION in .env");
     let client = match AzureOpenAIClient::new() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("┌─────────────────────────────────────────────────────────────┐");
-            eprintln!("│ ERROR: Failed to create AzureOpenAIClient                   │");
-            eprintln!(
-                "│ {}                                                          │",
-                e
-            );
-            eprintln!("└─────────────────────────────────────────────────────────────┘");
+            eprintln!("ERROR: Failed to create AzureOpenAIClient: {}", e);
             return;
         }
     };
@@ -212,38 +131,22 @@ async fn main() {
     let prompt = fs::read_to_string("prompt.txt").expect("Failed to read prompt.txt");
     let project_root = env::var("PROJECT_PATH").expect("PROJECT_PATH not set");
 
-    // Initialize TPM limiter with 10 second minimum interval
     let tpm_limit: u32 = env::var("LLM_TPM")
         .unwrap_or_else(|_| "20000".to_string())
         .parse()
         .unwrap_or(20000);
 
     let min_interval_secs: u64 = env::var("LLM_MIN_INTERVAL")
-        .unwrap_or_else(|_| "10".to_string())
+        .unwrap_or_else(|_| "1".to_string())
         .parse()
-        .unwrap_or(10);
+        .unwrap_or(1);
 
     let mut tpm_limiter = TPMLimiter::new(tpm_limit, min_interval_secs);
 
-    println!("┌─────────────────────────────────────────────────────────────┐");
-    println!("│ CONFIGURATION                                               │");
-    println!("├─────────────────────────────────────────────────────────────┤");
-    println!(
-        "│ Project Path:    {}                                         │",
-        format!("{:<40}", project_root)
-            .chars()
-            .take(40)
-            .collect::<String>()
-    );
-    println!(
-        "│ Max TPM:         {:>6} tokens/minute                       │",
-        tpm_limit
-    );
-    println!(
-        "│ Min Interval:    {:>6} seconds                             │",
-        min_interval_secs
-    );
-    println!("└─────────────────────────────────────────────────────────────┘");
+    println!("Configuration:");
+    println!("- Project: {}", project_root);
+    println!("- Max TPM: {}", tpm_limit);
+    println!("- Min Interval: {}s", min_interval_secs);
     println!();
 
     let mut iteration = 0;
@@ -251,14 +154,7 @@ async fn main() {
 
     loop {
         iteration += 1;
-
-        println!("╔═════════════════════════════════════════════════════════════╗");
-        println!(
-            "║ ITERATION {:>2}                                               ║",
-            iteration
-        );
-        println!("╚═════════════════════════════════════════════════════════════╝");
-        println!();
+        println!("=== ITERATION {} ===", iteration);
 
         let context = if conversation_history.is_empty() {
             format!(
@@ -275,28 +171,12 @@ async fn main() {
             )
         };
 
-        // Count input tokens
         let input_tokens = count_tokens(&context);
+        println!("[REQUEST] Input tokens: {}", input_tokens);
 
-        println!("┌─────────────────────────────────────────────────────────────┐");
-        println!("│ REQUEST                                                     │");
-        println!("├─────────────────────────────────────────────────────────────┤");
-        println!(
-            "│ Input Tokens:  {:>6} tokens                               │",
-            input_tokens
-        );
-        println!("└─────────────────────────────────────────────────────────────┘");
-        println!();
-
-        // Apply TPM rate limiting before making LLM request
         tpm_limiter.wait_if_needed();
-        tpm_limiter.print_tpm_status();
-        println!();
 
-        println!("┌─────────────────────────────────────────────────────────────┐");
-        println!("│ Sending request to LLM...                                   │");
-        println!("└─────────────────────────────────────────────────────────────┘");
-
+        println!("[LLM] Sending request...");
         match client.generate(&context, &serde_json::json!({})).await {
             Ok(resp) => {
                 let raw_response = resp.to_string();
@@ -304,135 +184,24 @@ async fn main() {
                 let output_tokens = count_tokens(&response);
                 let total_tokens = input_tokens + output_tokens;
 
-                // Add token usage
                 tpm_limiter.add_token_usage(total_tokens);
 
-                println!();
-                println!("┌─────────────────────────────────────────────────────────────┐");
-                println!("│ RESPONSE                                                    │");
-                println!("├─────────────────────────────────────────────────────────────┤");
                 println!(
-                    "│ Output Tokens: {:>6} tokens                               │",
-                    output_tokens
+                    "[RESPONSE] Output tokens: {}, Total: {}",
+                    output_tokens, total_tokens
                 );
-                println!(
-                    "│ Total Tokens:  {:>6} tokens                               │",
-                    total_tokens
-                );
-                println!("└─────────────────────────────────────────────────────────────┘");
-                println!();
-
-                // Print response in a box
-                println!("┌─────────────────────────────────────────────────────────────┐");
-                println!("│ AI RESPONSE:                                                │");
-                println!("└─────────────────────────────────────────────────────────────┘");
-                for line in response.lines().take(20) {
-                    let trimmed = if line.len() > 61 {
-                        format!("{}...", &line[..58])
-                    } else {
-                        line.to_string()
-                    };
-                    println!("  {}", trimmed);
-                }
-                if response.lines().count() > 20 {
-                    println!("  ... ({} more lines)", response.lines().count() - 20);
-                }
-                println!();
-
-                // DEBUG: Print raw response for analysis
-                println!("┌─────────────────────────────────────────────────────────────┐");
-                println!("│ DEBUG: RAW RESPONSE ANALYSIS                               │");
-                println!("├─────────────────────────────────────────────────────────────┤");
-                println!(
-                    "│ Raw response length: {:>6} characters               │",
-                    raw_response.len()
-                );
-                println!(
-                    "│ Filtered length:     {:>6} characters               │",
-                    response.len()
-                );
-                println!(
-                    "│ Contains 'read_file': {}                             │",
-                    response.contains("read_file")
-                );
-                println!(
-                    "│ Contains 'execute_command': {}                       │",
-                    response.contains("execute_command")
-                );
-                println!(
-                    "│ Contains 'CHANGE:': {}                               │",
-                    response.contains("CHANGE:")
-                );
-                println!("└─────────────────────────────────────────────────────────────┘");
-                println!();
+                println!("[RAW RESPONSE] {}", raw_response);
+                println!("[FILTERED RESPONSE] {}", response);
 
                 conversation_history.push(format!("Assistant: {}", response));
 
                 let tools = extract_tools(&response);
+                println!("[TOOLS] Found {} tools", tools.len());
 
-                println!("┌─────────────────────────────────────────────────────────────┐");
-                println!(
-                    "│ TOOLS EXTRACTED: {:>2}                                       │",
-                    tools.len()
-                );
-                println!("└─────────────────────────────────────────────────────────────┘");
-
-                // DEBUG: Show what was found
                 if tools.is_empty() {
-                    println!();
-                    println!("┌─────────────────────────────────────────────────────────────┐");
-                    println!("│ DEBUG: TOOL EXTRACTION FAILED                              │");
-                    println!("├─────────────────────────────────────────────────────────────┤");
-                    println!("│ Searching for patterns in response...                      │");
-
-                    // Check for common patterns that might indicate tools
-                    let lines: Vec<&str> = response.lines().collect();
-                    for (i, line) in lines.iter().enumerate().take(10) {
-                        println!(
-                            "│ Line {}: {:>60} │",
-                            i,
-                            if line.len() > 60 {
-                                format!("{}...", &line[..57])
-                            } else {
-                                line.to_string()
-                            }
-                        );
-                    }
-
-                    // Check for specific patterns
-                    println!("│ PATTERN ANALYSIS:                                        │");
-                    println!(
-                        "│ - 'read_file(' found: {}                                │",
-                        response.contains("read_file(")
-                    );
-                    println!(
-                        "│ - 'execute_command(' found: {}                          │",
-                        response.contains("execute_command(")
-                    );
-                    println!(
-                        "│ - 'execute_command:' found: {}                          │",
-                        response.contains("execute_command:")
-                    );
-                    println!(
-                        "│ - 'CHANGE:' found: {}                                    │",
-                        response.contains("CHANGE:")
-                    );
-                    println!(
-                        "│ - '<<<<<<<' found: {}                                    │",
-                        response.contains("<<<<<<<")
-                    );
-                    println!(
-                        "│ - '>>>>>>>' found: {}                                    │",
-                        response.contains(">>>>>>>")
-                    );
-                    println!("└─────────────────────────────────────────────────────────────┘");
-                    println!();
-
-                    println!("┌─────────────────────────────────────────────────────────────┐");
-                    println!("│ WARNING: No tools found                                     │");
-                    println!("│ Continue? (y/n):                                            │");
-                    println!("└─────────────────────────────────────────────────────────────┘");
-                    print!("> ");
+                    println!("[WARNING] No tools found in response!");
+                    println!("Response was: {}", response);
+                    println!("Continue? (y/n): ");
                     io::stdout().flush().ok();
                     let mut input = String::new();
                     io::stdin().read_line(&mut input).unwrap();
@@ -440,75 +209,21 @@ async fn main() {
                         break;
                     }
                     continue;
-                } else {
-                    println!();
-                    println!("┌─────────────────────────────────────────────────────────────┐");
-                    println!("│ DEBUG: TOOLS FOUND                                         │");
-                    println!("├─────────────────────────────────────────────────────────────┤");
-                    for (i, (tool, param)) in tools.iter().enumerate() {
-                        println!(
-                            "│ Tool {}: {:<20} -> {:>30} │",
-                            i + 1,
-                            tool,
-                            if param.len() > 30 {
-                                format!("{}...", &param[..27])
-                            } else {
-                                param.to_string()
-                            }
-                        );
-                    }
-                    println!("└─────────────────────────────────────────────────────────────┘");
-                    println!();
                 }
 
                 let mut all_results = Vec::new();
 
                 for (i, (tool, param)) in tools.iter().enumerate() {
-                    println!();
-                    println!("┌─────────────────────────────────────────────────────────────┐");
                     println!(
-                        "│ EXECUTING TOOL {}/{}                                         │",
+                        "[EXECUTE] Tool {}/{}: {} -> {}",
                         i + 1,
-                        tools.len()
+                        tools.len(),
+                        tool,
+                        param
                     );
-                    println!("├─────────────────────────────────────────────────────────────┤");
-                    println!(
-                        "│ Tool:  {}                                                   │",
-                        format!("{:<50}", tool).chars().take(50).collect::<String>()
-                    );
-                    println!(
-                        "│ Param: {}                                                   │",
-                        format!(
-                            "{:<50}",
-                            if param.len() > 50 {
-                                format!("{}...", &param[..47])
-                            } else {
-                                param.to_string()
-                            }
-                        )
-                        .chars()
-                        .take(50)
-                        .collect::<String>()
-                    );
-                    println!("└─────────────────────────────────────────────────────────────┘");
 
                     let result = execute_tool(tool, param, &project_root);
-
-                    println!();
-                    println!("┌─────────────────────────────────────────────────────────────┐");
-                    println!("│ RESULT:                                                     │");
-                    println!("└─────────────────────────────────────────────────────────────┘");
-                    for line in result.lines().take(15) {
-                        let trimmed = if line.len() > 61 {
-                            format!("{}...", &line[..58])
-                        } else {
-                            line.to_string()
-                        };
-                        println!("  {}", trimmed);
-                    }
-                    if result.lines().count() > 15 {
-                        println!("  ... ({} more lines)", result.lines().count() - 15);
-                    }
+                    println!("[RESULT] {}", result);
 
                     all_results.push(format!("Tool: {}\nResult:\n{}", tool, result));
 
@@ -517,19 +232,7 @@ async fn main() {
                             && !result.contains("error:")
                             && !result.contains("Error")
                         {
-                            println!();
-                            println!(
-                                "╔═════════════════════════════════════════════════════════════╗"
-                            );
-                            println!(
-                                "║                    ✓ SUCCESS                               ║"
-                            );
-                            println!(
-                                "║              Task Completed Successfully!                  ║"
-                            );
-                            println!(
-                                "╚═════════════════════════════════════════════════════════════╝"
-                            );
+                            println!("[SUCCESS] Task completed!");
                             return;
                         }
                     }
@@ -542,30 +245,10 @@ async fn main() {
                 }
 
                 println!();
-                tpm_limiter.print_tpm_status();
-                println!();
             }
             Err(err) => {
-                let e = err.to_string();
-                println!();
-                println!("┌─────────────────────────────────────────────────────────────┐");
-                println!("│ ERROR                                                       │");
-                println!("├─────────────────────────────────────────────────────────────┤");
-                println!(
-                    "│ {}                                                          │",
-                    format!(
-                        "{:<55}",
-                        if e.len() > 55 {
-                            format!("{}...", &e[..52])
-                        } else {
-                            e
-                        }
-                    )
-                );
-                println!("│                                                             │");
-                println!("│ Continue? (y/n):                                            │");
-                println!("└─────────────────────────────────────────────────────────────┘");
-                print!("> ");
+                eprintln!("[ERROR] LLM request failed: {}", err);
+                println!("Continue? (y/n): ");
                 io::stdout().flush().ok();
                 let mut input = String::new();
                 io::stdin().read_line(&mut input).unwrap();
@@ -578,11 +261,9 @@ async fn main() {
 }
 
 fn extract_tools(text: &str) -> Vec<(String, String)> {
-    println!("┌─────────────────────────────────────────────────────────────┐");
-    println!("│ DEBUG: EXTRACT_TOOLS CALLED                                 │");
-    println!("├─────────────────────────────────────────────────────────────┤");
+    println!("[DEBUG] === TOOL EXTRACTION START ===");
+    println!("[DEBUG] Input text length: {} chars", text.len());
 
-    // Strip code blocks first to handle markdown formatting
     let cleaned_text = text
         .replace("```rust", "")
         .replace("```sh", "")
@@ -590,296 +271,253 @@ fn extract_tools(text: &str) -> Vec<(String, String)> {
         .replace("```", "");
     let text = cleaned_text.as_str();
 
-    println!(
-        "│ Text after cleaning: {:>6} chars                    │",
-        text.len()
-    );
-    println!("└─────────────────────────────────────────────────────────────┘");
-
     let mut tools = Vec::new();
 
-    // Extract read_file calls
-    if text.contains("read_file") {
-        println!("┌─────────────────────────────────────────────────────────────┐");
-        println!("│ DEBUG: Searching for read_file patterns                     │");
-        for line in text.lines() {
-            if line.contains("read_file") {
-                println!(
-                    "│ Found 'read_file' in line: {:>40} │",
-                    if line.len() > 40 {
-                        format!("{}...", &line[..37])
-                    } else {
-                        line.to_string()
-                    }
-                );
+    // First priority: Extract delta format (file changes)
+    let delta_tools = extract_delta_format(text);
+    tools.extend(delta_tools);
 
-                if let Some(start) = line.find("read_file(") {
-                    if let Some(end) = line[start..].find(')') {
-                        let param = line[start + 10..start + end]
-                            .trim()
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .to_string();
-                        if !param.is_empty() {
-                            println!(
-                                "│ Extracted read_file param: {:>30} │",
-                                if param.len() > 30 {
-                                    format!("{}...", &param[..27])
-                                } else {
-                                    param.to_string()
-                                }
-                            );
-                            tools.push(("read_file".to_string(), param));
-                        }
+    // If we found delta tools, return them immediately (most common case)
+    if !tools.is_empty() {
+        println!(
+            "[DEBUG] Found {} delta tools, skipping other extraction",
+            tools.len()
+        );
+        return tools;
+    }
+
+    // Second: Look for simple tool patterns
+    let simple_tools = extract_simple_tools(text);
+    tools.extend(simple_tools);
+
+    println!("[DEBUG] === TOOL EXTRACTION COMPLETE ===");
+    println!("[DEBUG] Found {} unique tools:", tools.len());
+    for (i, (tool, param)) in tools.iter().enumerate() {
+        println!(
+            "[DEBUG]   {}. {}: '{}'",
+            i + 1,
+            tool,
+            if param.len() > 50 {
+                format!("{}...", &param[..47])
+            } else {
+                param.to_string()
+            }
+        );
+    }
+
+    tools
+}
+fn extract_delta_format(text: &str) -> Vec<(String, String)> {
+    println!("[DELTA] === DELTA EXTRACTION START ===");
+    let mut tools = Vec::new();
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        if line.starts_with("CHANGE:") {
+            println!("[DELTA] Found CHANGE at line {}: {}", i, line);
+
+            let file_path = line.replace("CHANGE:", "").trim().to_string();
+            let mut current_content = String::new();
+            let mut new_content = String::new();
+
+            i += 1; // Move to next line
+
+            // Look for <<<<<<< CURRENT
+            while i < lines.len() && !lines[i].trim().starts_with("<<<<<<< CURRENT") {
+                i += 1;
+            }
+
+            if i >= lines.len() {
+                println!("[DELTA] ERROR: No <<<<<<< CURRENT found after CHANGE");
+                break;
+            }
+
+            i += 1; // Skip <<<<<<< CURRENT line
+
+            // Collect CURRENT content until =======
+            while i < lines.len() && !lines[i].trim().starts_with("=======") {
+                current_content.push_str(lines[i]);
+                current_content.push_str("\n");
+                i += 1;
+            }
+
+            if i >= lines.len() {
+                println!("[DELTA] ERROR: No ======= found after CURRENT section");
+                break;
+            }
+
+            i += 1; // Skip ======= line
+
+            // Collect NEW content until >>>>>>> NEW
+            while i < lines.len() && !lines[i].trim().starts_with(">>>>>>> NEW") {
+                new_content.push_str(lines[i]);
+                new_content.push_str("\n");
+                i += 1;
+            }
+
+            if i >= lines.len() {
+                println!("[DELTA] ERROR: No >>>>>>> NEW found after NEW section");
+                break;
+            }
+
+            i += 1; // Skip >>>>>>> NEW line
+
+            // Trim the content to handle whitespace issues
+            let current_trimmed = current_content.trim();
+            let new_trimmed = new_content.trim();
+
+            println!("[DELTA] Extracted delta for file: {}", file_path);
+            println!(
+                "[DELTA] Current content length: {} -> {}",
+                current_content.len(),
+                current_trimmed.len()
+            );
+            println!(
+                "[DELTA] New content length: {} -> {}",
+                new_content.len(),
+                new_trimmed.len()
+            );
+
+            // Create the tool call
+            let tool_param = format!("{}:::{}\n{}", file_path, current_trimmed, new_trimmed);
+
+            tools.push(("write_file_delta".to_string(), tool_param));
+        } else {
+            i += 1;
+        }
+    }
+
+    println!("[DELTA] === DELTA EXTRACTION COMPLETE ===");
+    println!("[DELTA] Found {} delta changes", tools.len());
+    tools
+}
+fn extract_simple_tools(text: &str) -> Vec<(String, String)> {
+    println!("[SIMPLE] === SIMPLE TOOL EXTRACTION START ===");
+    let mut tools = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Skip delta format lines
+        if line.starts_with("CHANGE:")
+            || line.starts_with("<<<<<<<")
+            || line.starts_with("=======")
+            || line.starts_with(">>>>>>>")
+        {
+            continue;
+        }
+
+        println!("[SIMPLE] Processing line: '{}'", line);
+
+        // read_file patterns
+        if line.contains("read_file") {
+            // read_file("path")
+            if let Some(start) = line.find("read_file(") {
+                if let Some(end) = line[start..].find(')') {
+                    let param = line[start + 10..start + end]
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+                    if !param.is_empty() {
+                        println!("[SIMPLE] Found read_file: '{}'", param);
+                        tools.push(("read_file".to_string(), param));
+                        continue;
+                    }
+                }
+            }
+            // read_file: "path"
+            if let Some(start) = line.find("read_file:") {
+                let after = line[start + 10..].trim();
+                if let Some(param) = extract_between_quotes(after) {
+                    println!("[SIMPLE] Found read_file: '{}'", param);
+                    tools.push(("read_file".to_string(), param));
+                    continue;
+                }
+            }
+        }
+
+        // execute_command patterns
+        if line.contains("execute_command") {
+            // execute_command("cmd")
+            if let Some(start) = line.find("execute_command(") {
+                let after = line[start + 16..].trim();
+                if let Some(end) = after.find(')') {
+                    let content = &after[..end];
+                    if let Some(param) = extract_between_quotes(content) {
+                        println!("[SIMPLE] Found execute_command: '{}'", param);
+                        tools.push(("execute_command".to_string(), param));
+                        continue;
+                    }
+                }
+            }
+            // execute_command: "cmd"
+            if let Some(start) = line.find("execute_command:") {
+                let after = line[start + 16..].trim();
+                if let Some(param) = extract_between_quotes(after) {
+                    println!("[SIMPLE] Found execute_command: '{}'", param);
+                    tools.push(("execute_command".to_string(), param));
+                    continue;
+                }
+            }
+            // OSS GPT weird format
+            if line.contains("code{\"command\":\"") {
+                if let Some(start) = line.find("code{\"command\":\"") {
+                    let after = line[start + 16..].trim();
+                    if let Some(end) = after.find('"') {
+                        let param = &after[..end];
+                        println!("[SIMPLE] Found OSS GPT command: '{}'", param);
+                        tools.push(("execute_command".to_string(), param.to_string()));
+                        continue;
                     }
                 }
             }
         }
-        println!("└─────────────────────────────────────────────────────────────┘");
     }
 
-    // Extract execute_command calls - more flexible approach
-    if text.contains("execute_command") {
-        println!("┌─────────────────────────────────────────────────────────────┐");
-        println!("│ DEBUG: Searching for execute_command patterns               │");
+    println!("[SIMPLE] === SIMPLE TOOL EXTRACTION COMPLETE ===");
+    println!("[SIMPLE] Found {} simple tools", tools.len());
+    tools
+}
 
-        for line in text.lines() {
-            if line.contains("execute_command") {
-                println!(
-                    "│ Found 'execute_command' in line: {:>35} │",
-                    if line.len() > 35 {
-                        format!("{}...", &line[..32])
-                    } else {
-                        line.to_string()
-                    }
-                );
+fn extract_between_quotes(text: &str) -> Option<String> {
+    let text = text.trim();
 
-                // Handle execute_command("command") format
-                if let Some(start) = line.find("execute_command(") {
-                    let after_open = &line[start + 15..]; // After "execute_command("
-                    if let Some(end) = after_open.find(')') {
-                        let content = &after_open[..end];
-                        // Extract content between quotes
-                        if let Some(quote_start) = content.find('"') {
-                            if let Some(quote_end) = content[quote_start + 1..].find('"') {
-                                let param = &content[quote_start + 1..quote_start + 1 + quote_end];
-                                if !param.is_empty() {
-                                    println!(
-                                        "│ Extracted execute_command param: {:>25} │",
-                                        if param.len() > 25 {
-                                            format!("{}...", &param[..22])
-                                        } else {
-                                            param.to_string()
-                                        }
-                                    );
-                                    tools.push(("execute_command".to_string(), param.to_string()));
-                                }
-                            }
-                        } else if let Some(quote_start) = content.find('\'') {
-                            if let Some(quote_end) = content[quote_start + 1..].find('\'') {
-                                let param = &content[quote_start + 1..quote_start + 1 + quote_end];
-                                if !param.is_empty() {
-                                    println!(
-                                        "│ Extracted execute_command param: {:>25} │",
-                                        if param.len() > 25 {
-                                            format!("{}...", &param[..22])
-                                        } else {
-                                            param.to_string()
-                                        }
-                                    );
-                                    tools.push(("execute_command".to_string(), param.to_string()));
-                                }
-                            }
-                        }
-                    }
-                }
-                // Handle execute_command: "command" format
-                else if let Some(start) = line.find("execute_command:") {
-                    let after_colon = line[start + 15..].trim();
-                    println!(
-                        "│ After colon: {:>45} │",
-                        if after_colon.len() > 45 {
-                            format!("{}...", &after_colon[..42])
-                        } else {
-                            after_colon.to_string()
-                        }
-                    );
-
-                    // Extract quoted content
-                    if after_colon.starts_with('"') {
-                        if let Some(end_quote) = after_colon[1..].find('"') {
-                            let param = &after_colon[1..1 + end_quote];
-                            if !param.is_empty() {
-                                println!("│ Extracted quoted param: {:>30} │", param);
-                                tools.push(("execute_command".to_string(), param.to_string()));
-                            }
-                        }
-                    } else if after_colon.starts_with('\'') {
-                        if let Some(end_quote) = after_colon[1..].find('\'') {
-                            let param = &after_colon[1..1 + end_quote];
-                            if !param.is_empty() {
-                                println!("│ Extracted quoted param: {:>30} │", param);
-                                tools.push(("execute_command".to_string(), param.to_string()));
-                            }
-                        }
-                    } else {
-                        // No quotes, take until end of line or special characters
-                        let param = after_colon
-                            .split(|c: char| c == ')' || c == ']' || c == '`' || c == '\n')
-                            .next()
-                            .unwrap_or(after_colon)
-                            .trim()
-                            .to_string();
-                        if !param.is_empty() {
-                            println!("│ Extracted unquoted param: {:>28} │", param);
-                            tools.push(("execute_command".to_string(), param));
-                        }
-                    }
-                }
-            }
+    if text.starts_with('"') {
+        if let Some(end) = text[1..].find('"') {
+            return Some(text[1..1 + end].to_string());
         }
-        println!("└─────────────────────────────────────────────────────────────┘");
-    }
-
-    // Extract file changes using delta format
-    if text.contains("CHANGE:") {
-        println!("┌─────────────────────────────────────────────────────────────┐");
-        println!("│ DEBUG: Searching for CHANGE patterns                       │");
-
-        let mut current_file = String::new();
-        let mut in_change = false;
-        let mut in_current = false;
-        let mut in_new = false;
-        let mut current_content = String::new();
-        let mut new_content = String::new();
-
-        for line in text.lines() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with("CHANGE:") {
-                println!(
-                    "│ Found CHANGE: {:>45} │",
-                    if trimmed.len() > 45 {
-                        format!("{}...", &trimmed[..42])
-                    } else {
-                        trimmed.to_string()
-                    }
-                );
-
-                // Save previous change if exists
-                if !current_file.is_empty()
-                    && (!new_content.is_empty() || current_content.is_empty())
-                {
-                    tools.push((
-                        "write_file_delta".to_string(),
-                        format!(
-                            "{}:::{}\n{}",
-                            current_file,
-                            current_content.trim(),
-                            new_content.trim()
-                        ),
-                    ));
-                    println!("│ Saved change for: {:>38} │", current_file);
-                }
-
-                current_file = trimmed.replace("CHANGE:", "").trim().to_string();
-                in_change = true;
-                current_content.clear();
-                new_content.clear();
-                in_current = false;
-                in_new = false;
-                println!("│ New file: {:>45} │", current_file);
-            } else if in_change && trimmed.contains("<<<<<<< CURRENT") {
-                in_current = true;
-                in_new = false;
-                println!("│ Started CURRENT section                           │");
-            } else if in_change && trimmed.contains("=======") {
-                in_current = false;
-                in_new = true;
-                println!("│ Started NEW section                               │");
-            } else if in_change && trimmed.contains(">>>>>>> NEW") {
-                in_new = false;
-                in_change = false;
-                println!("│ Ended CHANGE section                              │");
-
-                if !current_file.is_empty()
-                    && (!new_content.is_empty() || current_content.is_empty())
-                {
-                    tools.push((
-                        "write_file_delta".to_string(),
-                        format!(
-                            "{}:::{}\n{}",
-                            current_file,
-                            current_content.trim(),
-                            new_content.trim()
-                        ),
-                    ));
-                    println!("│ Saved change for: {:>38} │", current_file);
-                }
-
-                current_file.clear();
-                current_content.clear();
-                new_content.clear();
-            } else if in_current {
-                current_content.push_str(line);
-                current_content.push('\n');
-            } else if in_new {
-                new_content.push_str(line);
-                new_content.push('\n');
-            }
-        }
-
-        // Handle last change if not closed properly
-        if !current_file.is_empty() && (!new_content.is_empty() || current_content.is_empty()) {
-            tools.push((
-                "write_file_delta".to_string(),
-                format!(
-                    "{}:::{}\n{}",
-                    current_file,
-                    current_content.trim(),
-                    new_content.trim()
-                ),
-            ));
-            println!("│ Saved final change for: {:>35} │", current_file);
-        }
-        println!("└─────────────────────────────────────────────────────────────┘");
-    }
-
-    // Remove duplicates while preserving order
-    let mut unique_tools = Vec::new();
-    for tool in tools {
-        if !unique_tools.contains(&tool) {
-            unique_tools.push(tool);
+    } else if text.starts_with('\'') {
+        if let Some(end) = text[1..].find('\'') {
+            return Some(text[1..1 + end].to_string());
         }
     }
 
-    println!("┌─────────────────────────────────────────────────────────────┐");
-    println!("│ DEBUG: EXTRACT_TOOLS COMPLETE                               │");
-    println!(
-        "│ Found {} tools                                            │",
-        unique_tools.len()
-    );
-    println!("└─────────────────────────────────────────────────────────────┘");
-
-    unique_tools
+    None
 }
 
 fn execute_tool(tool: &str, param: &str, root: &str) -> String {
     match tool {
         "read_file" => {
             let path = Path::new(root).join(param);
+            println!("[EXECUTE] Reading file: {}", path.display());
             fs::read_to_string(&path).unwrap_or_else(|e| format!("Error: {}", e))
         }
         "write_file_delta" => {
+            println!("[EXECUTE] Writing file delta: {}", param);
             let parts: Vec<&str> = param.splitn(2, ":::").collect();
             if parts.len() == 2 {
                 let path = Path::new(root).join(parts[0]);
                 let content_parts: Vec<&str> = parts[1].splitn(2, '\n').collect();
-
                 if content_parts.len() == 2 {
                     let old_content = content_parts[0].trim();
                     let new_content = content_parts[1].trim();
-
                     apply_delta(&path, old_content, new_content)
                 } else {
                     "Error: Invalid delta format".to_string()
@@ -889,6 +527,7 @@ fn execute_tool(tool: &str, param: &str, root: &str) -> String {
             }
         }
         "execute_command" => {
+            println!("[EXECUTE] Running command: {}", param);
             let output = Command::new("sh")
                 .arg("-c")
                 .arg(param)
@@ -903,7 +542,10 @@ fn execute_tool(tool: &str, param: &str, root: &str) -> String {
                 output.status.code().unwrap_or(-1)
             )
         }
-        _ => String::new(),
+        _ => {
+            println!("[ERROR] Unknown tool: {}", tool);
+            String::new()
+        }
     }
 }
 
@@ -911,7 +553,6 @@ fn apply_delta(path: &Path, old_content: &str, new_content: &str) -> String {
     let existing_content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(_) => {
-            // File doesn't exist - create new file
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).ok();
             }
@@ -922,7 +563,6 @@ fn apply_delta(path: &Path, old_content: &str, new_content: &str) -> String {
         }
     };
 
-    // If old_content is empty, replace entire file
     if old_content.is_empty() {
         return match fs::write(path, new_content) {
             Ok(_) => format!("Replaced entire file {}", path.display()),
@@ -930,7 +570,6 @@ fn apply_delta(path: &Path, old_content: &str, new_content: &str) -> String {
         };
     }
 
-    // Try to find and replace the old content
     if let Some(pos) = existing_content.find(old_content) {
         let mut new_file_content = String::new();
         new_file_content.push_str(&existing_content[..pos]);
@@ -943,9 +582,8 @@ fn apply_delta(path: &Path, old_content: &str, new_content: &str) -> String {
         }
     } else {
         format!(
-            "Error: Could not find the specified content in {}.\nLooking for:\n{}\n\nFile may have changed or content doesn't match exactly.",
-            path.display(),
-            old_content
+            "Error: Could not find the specified content in {}",
+            path.display()
         )
     }
 }
