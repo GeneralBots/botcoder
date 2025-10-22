@@ -1,6 +1,6 @@
-# Rust Code Agent - Interactive Chat System
+# General Bots Coder
 
-Professional interactive coding agent similar to Claude Code, powered by Azure OpenAI.
+Professional interactive coding agent powered by General Bots and LLM models.
 
 ## Features
 
