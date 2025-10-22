@@ -1,2 +1,7 @@
+target/
+Cargo.lock
 .env
-target
+*.swp
+*.swo
+*~
+.DS_Store
