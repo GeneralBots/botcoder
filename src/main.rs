@@ -1,26 +1,15 @@
 use color_eyre::eyre::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dotenvy::dotenv;
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    symbols,
-    text::{Line, Span},
-    widgets::{BarChart, Block, Borders, Dataset, Gauge, List, ListItem, Paragraph, Wrap},
-    Frame, Terminal,
-};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
-    collections::VecDeque,
     env, fs,
-    io::{self, Write},
-    path::Path,
-    process::Command,
-    time::{Duration, SystemTime},
+    io::{self, stdout},
+    time::Duration,
 };
 
 mod app;
@@ -29,19 +18,18 @@ mod tpm_limiter;
 mod ui;
 
 use app::AppState;
-use llm::AzureOpenAIClient;
+use llm::{AzureOpenAIClient, LLMProvider};
 use tpm_limiter::TPMLimiter;
 use ui::draw_ui;
 
-use crate::llm::LLMProvider;
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     dotenv().ok();
 
     // Setup terminal
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -52,9 +40,11 @@ async fn main() -> Result<()> {
     let client = AzureOpenAIClient::new()
         .map_err(|e| color_eyre::eyre::eyre!("Failed to create AzureOpenAIClient: {}", e))?;
 
-    let prompt = fs::read_to_string("prompt.txt").expect("Failed to read prompt.txt");
+    let prompt = fs::read_to_string("prompt.txt").unwrap_or_else(|_| {
+        "You are a helpful AI coding assistant.".to_string()
+    });
 
-    let project_root = env::var("PROJECT_PATH").expect("PROJECT_PATH not set");
+    let project_root = env::var("PROJECT_PATH").unwrap_or_else(|_| ".".to_string());
 
     let tpm_limit: u32 = env::var("LLM_TPM")
         .unwrap_or_else(|_| "20000".to_string())
@@ -82,11 +72,11 @@ async fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen,)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(err) = result {
-        println!("{:?}", err);
+        eprintln!("Error: {:?}", err);
     }
 
     Ok(())
@@ -110,47 +100,65 @@ async fn run_app(
     loop {
         terminal.draw(|f| draw_ui(f, app, &spinner_frames[spinner_index]))?;
 
-        // Update spinner every 100ms
-        if last_update.elapsed() > Duration::from_millis(100) {
+        // Update spinner every 80ms for fluid animation
+        if last_update.elapsed() > Duration::from_millis(80) {
             spinner_index = (spinner_index + 1) % spinner_frames.len();
             last_update = std::time::Instant::now();
         }
 
-        if app.should_quit || app.success_achieved {
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                        break;
-                    }
-                }
-            }
-            continue;
+        if app.should_quit {
+            break;
         }
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             app.should_quit = true;
-                            break;
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.should_quit = true;
                         }
                         KeyCode::Enter => {
-                            // Process user input from chat
-                            if !app.chat_input.trim().is_empty() {
+                            if !app.chat_input.trim().is_empty() && !app.processing {
                                 let user_message = app.chat_input.clone();
                                 app.chat_input.clear();
                                 app.conversation_history
                                     .push(format!("User: {}", user_message));
+                                app.processing = true;
                                 process_iteration(app, client, prompt, project_root, tpm_limiter)
                                     .await?;
+                                app.processing = false;
                             }
                         }
                         KeyCode::Char(c) => {
-                            app.chat_input.push(c);
+                            if !app.processing {
+                                app.chat_input.push(c);
+                            }
                         }
                         KeyCode::Backspace => {
-                            app.chat_input.pop();
+                            if !app.processing {
+                                app.chat_input.pop();
+                            }
+                        }
+                        KeyCode::Up => {
+                            if app.thoughts_scroll > 0 {
+                                app.thoughts_scroll = app.thoughts_scroll.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            let max_scroll = app.current_thoughts.lines().count().saturating_sub(10);
+                            if app.thoughts_scroll < max_scroll as u32 {
+                                app.thoughts_scroll += 1;
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            app.thoughts_scroll = app.thoughts_scroll.saturating_sub(5);
+                        }
+                        KeyCode::PageDown => {
+                            let max_scroll = app.current_thoughts.lines().count().saturating_sub(10);
+                            app.thoughts_scroll = (app.thoughts_scroll + 5).min(max_scroll as u32);
                         }
                         _ => {}
                     }
@@ -184,7 +192,7 @@ async fn process_iteration(
         )
     };
 
-    app.stats.input_tokens = crate::app::count_tokens(&context);
+    app.stats.input_tokens = app::count_tokens(&context);
     app.current_thoughts = "🤔 Thinking...".to_string();
 
     // Rate limiting
@@ -194,11 +202,11 @@ async fn process_iteration(
     // LLM Request
     match client.generate(&context, &serde_json::json!({})).await {
         Ok(resp) => {
-            let raw_response = resp.to_string();
-            let response = crate::app::filter_thinking_tokens(&raw_response);
+            let raw_response = resp;
+            let response = app::filter_thinking_tokens(&raw_response);
             app.current_thoughts = response.clone();
 
-            let output_tokens = crate::app::count_tokens(&response);
+            let output_tokens = app::count_tokens(&response);
             let total_tokens = app.stats.input_tokens + output_tokens;
 
             tpm_limiter.add_token_usage(total_tokens);
@@ -209,16 +217,13 @@ async fn process_iteration(
             app.conversation_history
                 .push(format!("Assistant: {}", response));
 
-            let tools = crate::app::extract_tools(&response);
+            let tools = app::extract_tools(&response);
 
             // Execute tools
             for (tool, param) in tools {
-                let result = crate::app::execute_tool(&tool, &param, project_root);
-                let tool_clone = tool.clone();
-                let param_clone = param.clone();
-                let result_clone = result.clone();
+                let result = app::execute_tool(&tool, &param, project_root);
                 app.current_tools
-                    .push((tool_clone, param_clone, result_clone));
+                    .push((tool.clone(), param.clone(), result.clone()));
 
                 // Check for success condition
                 if tool == "execute_command" && param.contains("cargo run") {
@@ -228,9 +233,33 @@ async fn process_iteration(
                 }
             }
 
-            app.conversation_history
-                .push(format!("Tool Results:\n{:?}", app.current_tools));
+            if !app.current_tools.is_empty() {
+                let tool_summary: Vec<String> = app
+                    .current_tools
+                    .iter()
+                    .map(|(t, p, r)| {
+                        format!(
+                            "{}: {} -> {}",
+                            t,
+                            if p.len() > 30 {
+                                format!("{}...", &p[..30])
+                            } else {
+                                p.clone()
+                            },
+                            if r.len() > 50 {
+                                format!("{}...", &r[..50])
+                            } else {
+                                r.clone()
+                            }
+                        )
+                    })
+                    .collect();
 
+                app.conversation_history
+                    .push(format!("Tool Results:\n{}", tool_summary.join("\n")));
+            }
+
+            // Keep only last 10 conversation items
             if app.conversation_history.len() > 10 {
                 app.conversation_history
                     .drain(0..app.conversation_history.len() - 10);

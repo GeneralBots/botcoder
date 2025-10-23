@@ -28,7 +28,6 @@ impl TPMLimiter {
         self.total_tokens_used += tokens;
         self.last_request = Some(now);
 
-        // Clean up old entries (older than 1 minute)
         let one_minute_ago = now - Duration::from_secs(60);
         while let Some(front) = self.token_usage.front() {
             if front.0 < one_minute_ago {
@@ -51,8 +50,7 @@ impl TPMLimiter {
 
         let current_tpm = self.get_current_tpm();
         if current_tpm >= self.max_tpm {
-            let wait_time = Duration::from_secs(60);
-            std::thread::sleep(wait_time);
+            std::thread::sleep(Duration::from_secs(60));
         }
     }
 

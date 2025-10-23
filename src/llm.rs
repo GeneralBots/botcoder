@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 #[async_trait]
@@ -86,7 +86,6 @@ impl RateLimiter {
         let now = Instant::now();
         let one_minute_ago = now - Duration::from_secs(60);
 
-        // Clean old entries
         while let Some((time, _)) = requests.front() {
             if *time < one_minute_ago {
                 requests.pop_front();
@@ -95,24 +94,16 @@ impl RateLimiter {
             }
         }
 
-        // Calculate current TPM
         let current_tpm: u32 = requests.iter().map(|(_, tokens)| tokens).sum();
 
-        // If adding these tokens would exceed the limit, wait
         if current_tpm + estimated_tokens > self.max_tpm {
             if let Some((oldest_time, _)) = requests.front() {
                 let elapsed = now.duration_since(*oldest_time);
                 if elapsed < Duration::from_secs(60) {
                     let wait_time = Duration::from_secs(60) - elapsed + Duration::from_millis(100);
-                    info!(
-                        "TPM limit reached ({}/{}), waiting {}ms",
-                        current_tpm,
-                        self.max_tpm,
-                        wait_time.as_millis()
-                    );
+                    info!("TPM limit reached, waiting {}ms", wait_time.as_millis());
                     tokio::time::sleep(wait_time).await;
 
-                    // Recalculate after wait
                     let now = Instant::now();
                     let one_minute_ago = now - Duration::from_secs(60);
                     requests.retain(|(time, _)| *time >= one_minute_ago);
@@ -120,7 +111,6 @@ impl RateLimiter {
             }
         }
 
-        // Add this request to the queue
         requests.push_back((now, estimated_tokens));
         *self.total_tokens_used.lock().await += estimated_tokens;
     }
@@ -155,9 +145,8 @@ impl AzureOpenAIClient {
         let endpoint = std::env::var("LLM_URL").map_err(|_| "LLM_URL not set")?;
         let api_key = std::env::var("LLM_KEY").map_err(|_| "LLM_KEY not set")?;
         let api_version =
-            std::env::var("LLM_VERSION").unwrap_or_else(|_| "2023-12-01-preview".to_string());
-        let deployment =
-            std::env::var("LLM_MODEL").unwrap_or_else(|_| "DeepSeek-V3-0324".to_string());
+            std::env::var("LLM_VERSION").unwrap_or_else(|_| "2024-05-01-preview".to_string());
+        let deployment = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4".to_string());
 
         let tpm_limit: u32 = std::env::var("LLM_TPM")
             .unwrap_or_else(|_| "20000".to_string())
@@ -189,8 +178,8 @@ impl AzureOpenAIClient {
         max_tokens: Option<u32>,
     ) -> Result<ChatCompletionResponse, Box<dyn std::error::Error>> {
         let url = format!(
-            "{}/chat/completions?api-version=2024-05-01-preview",
-            self.config.endpoint
+            "{}/chat/completions?api-version={}",
+            self.config.endpoint, self.config.api_version
         );
 
         let request_body = ChatCompletionRequest {
@@ -203,24 +192,16 @@ impl AzureOpenAIClient {
             model: self.config.deployment.clone(),
         };
 
-        // Estimate tokens (rough approximation)
         let estimated_tokens = request_body
             .messages
             .iter()
             .map(|msg| msg.content.len() / 4)
             .sum::<usize>() as u32
-            + 100; // Add buffer for system tokens
+            + 100;
 
-        // Apply rate limiting
         self.rate_limiter.wait_if_needed(estimated_tokens).await;
 
-        info!("Sending request to Azure OpenAI: {}", url);
-        info!(
-            "Estimated tokens: {}, Current TPM: {}/{}",
-            estimated_tokens,
-            self.rate_limiter.get_current_tpm().await,
-            self.rate_limiter.max_tpm
-        );
+        info!("Sending request to Azure OpenAI");
 
         let response = self
             .client
@@ -234,17 +215,15 @@ impl AzureOpenAIClient {
         if !response.status().is_success() {
             let error_text = response.text().await?;
             error!("Azure OpenAI API error: {}", error_text);
-            return Err(format!("Azure OpenAI API error: {}", error_text).into());
+            return Err(format!("API error: {}", error_text).into());
         }
 
         let completion_response: ChatCompletionResponse = response.json().await?;
 
-        // Update with actual token usage
         if let Some(usage) = Some(&completion_response.usage) {
             let actual_tokens = usage.total_tokens;
             info!("Actual token usage: {}", actual_tokens);
 
-            // Replace the estimated entry with actual usage
             let mut requests = self.rate_limiter.requests.lock().await;
             if let Some(back) = requests.back_mut() {
                 back.1 = actual_tokens;
@@ -258,7 +237,7 @@ impl AzureOpenAIClient {
         let messages = vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are a helpful assistant.".to_string(),
+                content: "You are a helpful AI coding assistant.".to_string(),
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -271,7 +250,7 @@ impl AzureOpenAIClient {
         if let Some(choice) = response.choices.first() {
             Ok(choice.message.content.clone())
         } else {
-            Err("No response from AI".into())
+            Err(" No response from AI".into())
         }
     }
 }
@@ -283,24 +262,16 @@ impl LLMProvider for AzureOpenAIClient {
         prompt: &str,
         _config: &Value,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        info!("Generating response using Azure OpenAI...");
-        info!("Prompt length: {} characters", prompt.len());
+        info!("Generating response...");
 
         match self.simple_chat(prompt).await {
-            Ok(content) => {
-                info!("Received content successfully");
-                Ok(content)
-            }
+            Ok(content) => Ok(content),
             Err(e) => {
-                // Convert the error into a Send + Sync boxed error by
-                // flattening it to a string and creating an std::io::Error.
                 let err = std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Azure OpenAI generation failed: {}", e),
+                    format!("Generation failed: {}", e),
                 );
-                let boxed_err: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
-                error!("Failed to generate content: {}", boxed_err);
-                Err(boxed_err)
+                Err(Box::new(err))
             }
         }
     }

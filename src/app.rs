@@ -3,15 +3,17 @@ use std::{fs, path::Path, process::Command};
 pub struct AppState {
     pub iteration: u32,
     pub conversation_history: Vec<String>,
-    pub chat_input: String, // Add this line
+    pub chat_input: String,
     pub current_thoughts: String,
-    pub current_tools: Vec<(String, String, String)>, // (tool, param, result)
+    pub current_tools: Vec<(String, String, String)>,
     pub stats: Stats,
     pub should_quit: bool,
     pub success_achieved: bool,
-    pub thoughts_scroll: u32, // Add this
-    pub tools_scroll: u32,    // Add this
+    pub thoughts_scroll: u32,
+    pub tools_scroll: u32,
+    pub processing: bool,
 }
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -22,9 +24,10 @@ impl Default for AppState {
             stats: Stats::default(),
             should_quit: false,
             success_achieved: false,
-            thoughts_scroll: 0,        // Add this
-            tools_scroll: 0,           // Add this
-            chat_input: String::new(), // Add this line
+            thoughts_scroll: 0,
+            tools_scroll: 0,
+            chat_input: String::new(),
+            processing: false,
         }
     }
 }
@@ -50,7 +53,8 @@ impl Default for Stats {
 }
 
 pub fn count_tokens(text: &str) -> u32 {
-    text.split_whitespace().count() as u32
+    // Rough approximation: ~4 chars per token
+    (text.len() / 4).max(text.split_whitespace().count()) as u32
 }
 
 pub fn filter_thinking_tokens(text: &str) -> String {
@@ -64,7 +68,6 @@ pub fn filter_thinking_tokens(text: &str) -> String {
 pub fn extract_tools(text: &str) -> Vec<(String, String)> {
     let mut tools = Vec::new();
 
-    // Clean the text first
     let cleaned_text = text
         .replace("```rust", "")
         .replace("```sh", "")
@@ -96,9 +99,9 @@ pub fn extract_tools(text: &str) -> Vec<(String, String)> {
     // Extract execute_command calls
     if text.contains("execute_command") {
         for line in text.lines() {
-            if line.contains("execute_command") {
+            if line.contains("execute_command(") {
                 if let Some(start) = line.find("execute_command(") {
-                    let after_open = &line[start + 15..];
+                    let after_open = &line[start + 16..];
                     if let Some(end) = after_open.find(')') {
                         let content = &after_open[..end];
                         if let Some(quote_start) = content.find('"') {
@@ -107,16 +110,6 @@ pub fn extract_tools(text: &str) -> Vec<(String, String)> {
                                 if !param.is_empty() {
                                     tools.push(("execute_command".to_string(), param.to_string()));
                                 }
-                            }
-                        }
-                    }
-                } else if let Some(start) = line.find("execute_command:") {
-                    let after_colon = line[start + 15..].trim();
-                    if after_colon.starts_with('"') {
-                        if let Some(end_quote) = after_colon[1..].find('"') {
-                            let param = &after_colon[1..1 + end_quote];
-                            if !param.is_empty() {
-                                tools.push(("execute_command".to_string(), param.to_string()));
                             }
                         }
                     }
@@ -135,7 +128,6 @@ pub fn extract_tools(text: &str) -> Vec<(String, String)> {
 
             if line.starts_with("CHANGE:") {
                 let file_path = line.replace("CHANGE:", "").trim().to_string();
-
                 let mut current_content = String::new();
                 let mut new_content = String::new();
                 let mut in_current = false;
@@ -143,7 +135,7 @@ pub fn extract_tools(text: &str) -> Vec<(String, String)> {
 
                 i += 1;
                 while i < lines.len() {
-                    let current_line = lines[i].trim();
+                    let current_line = lines[i];
 
                     if current_line.contains("<<<<<<< CURRENT") {
                         in_current = true;
@@ -164,8 +156,7 @@ pub fn extract_tools(text: &str) -> Vec<(String, String)> {
                     i += 1;
                 }
 
-                if !file_path.is_empty() && (!new_content.is_empty() || current_content.is_empty())
-                {
+                if !file_path.is_empty() {
                     tools.push((
                         "write_file_delta".to_string(),
                         format!(
@@ -182,7 +173,7 @@ pub fn extract_tools(text: &str) -> Vec<(String, String)> {
         }
     }
 
-    // Remove duplicates while preserving order
+    // Remove duplicates
     let mut unique_tools = Vec::new();
     for tool in tools {
         if !unique_tools.contains(&tool) {
@@ -197,7 +188,7 @@ pub fn execute_tool(tool: &str, param: &str, root: &str) -> String {
     match tool {
         "read_file" => {
             let path = Path::new(root).join(param);
-            fs::read_to_string(&path).unwrap_or_else(|e| format!("Error: {}", e))
+            fs::read_to_string(&path).unwrap_or_else(|e| format!("Error reading file: {}", e))
         }
         "write_file_delta" => {
             let parts: Vec<&str> = param.splitn(2, ":::").collect();
@@ -210,10 +201,10 @@ pub fn execute_tool(tool: &str, param: &str, root: &str) -> String {
                     let new_content = content_parts[1].trim();
                     apply_delta(&path, old_content, new_content)
                 } else {
-                    "Error: Invalid delta format - missing content separator".to_string()
+                    "Error: Invalid delta format".to_string()
                 }
             } else {
-                "Error: Invalid write_file_delta format - missing path separator".to_string()
+                "Error: Invalid write_file_delta format".to_string()
             }
         }
         "execute_command" => {
@@ -241,9 +232,7 @@ pub fn execute_tool(tool: &str, param: &str, root: &str) -> String {
                         stdout, stderr, exit_code
                     )
                 }
-                Err(e) => {
-                    format!("Error executing command: {}", e)
-                }
+                Err(e) => format!("Error executing command: {}", e),
             }
         }
         _ => format!("Unknown tool: {}", tool),
@@ -258,16 +247,16 @@ fn apply_delta(path: &Path, old_content: &str, new_content: &str) -> String {
                 let _ = fs::create_dir_all(parent);
             }
             return match fs::write(path, new_content) {
-                Ok(_) => format!("Created new file: {}", path.display()),
-                Err(e) => format!("Error creating file: {}", e),
+                Ok(_) => format!("✓ Created new file: {}", path.display()),
+                Err(e) => format!("✗ Error creating file: {}", e),
             };
         }
     };
 
     if old_content.is_empty() {
         return match fs::write(path, new_content) {
-            Ok(_) => format!("Replaced entire file: {}", path.display()),
-            Err(e) => format!("Error replacing file: {}", e),
+            Ok(_) => format!("✓ Replaced entire file: {}", path.display()),
+            Err(e) => format!("✗ Error replacing file: {}", e),
         };
     }
 
@@ -278,15 +267,14 @@ fn apply_delta(path: &Path, old_content: &str, new_content: &str) -> String {
         updated_content.push_str(&existing_content[pos + old_content.len()..]);
 
         match fs::write(path, updated_content) {
-            Ok(_) => format!("Successfully applied delta to: {}", path.display()),
-            Err(e) => format!("Error applying delta: {}", e),
+            Ok(_) => format!("✓ Successfully applied delta to: {}", path.display()),
+            Err(e) => format!("✗ Error applying delta: {}", e),
         }
     } else {
         format!(
-            "Error: Could not find the specified content in {}\nLooking for:\n{}\n\nCurrent file content:\n{}",
+            "✗ Could not find content in {}\nSearching for:\n{}",
             path.display(),
-            old_content,
-            existing_content
+            old_content
         )
     }
 }
