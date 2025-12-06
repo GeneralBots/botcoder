@@ -1,50 +1,135 @@
-use color_eyre::eyre::Result;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use dotenvy::dotenv;
-use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{
-    env, fs,
-    io::{self, stdout},
-    time::Duration,
-};
+use dotenv::dotenv;
+use std::collections::VecDeque;
+use std::env;
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
-mod app;
 mod llm;
-mod tpm_limiter;
-mod ui;
+use llm::AzureOpenAIClient;
 
-use app::AppState;
-use llm::{AzureOpenAIClient, LLMProvider};
-use tpm_limiter::TPMLimiter;
-use ui::draw_ui;
+use crate::llm::LLMProvider;
+
+struct TPMLimiter {
+    max_tpm: u32,
+    min_interval: Duration,
+    token_usage: VecDeque<(SystemTime, u32)>,
+    last_request: Option<SystemTime>,
+    total_tokens_used: u32,
+}
+
+impl TPMLimiter {
+    fn new(max_tpm: u32, min_interval_secs: u64) -> Self {
+        Self {
+            max_tpm,
+            min_interval: Duration::from_secs(min_interval_secs),
+            token_usage: VecDeque::new(),
+            last_request: None,
+            total_tokens_used: 0,
+        }
+    }
+
+    fn get_current_tpm(&self) -> u32 {
+        let now = SystemTime::now();
+        let one_minute_ago = now - Duration::from_secs(60);
+
+        self.token_usage
+            .iter()
+            .filter(|(time, _)| *time >= one_minute_ago)
+            .map(|(_, tokens)| tokens)
+            .sum()
+    }
+
+    fn add_token_usage(&mut self, tokens: u32) {
+        let now = SystemTime::now();
+        self.token_usage.push_back((now, tokens));
+        self.total_tokens_used += tokens;
+
+        // Clean old entries
+        let one_minute_ago = now - Duration::from_secs(60);
+        while let Some((time, _)) = self.token_usage.front() {
+            if *time < one_minute_ago {
+                self.token_usage.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn wait_if_needed(&mut self) {
+        let now = SystemTime::now();
+
+        // First, enforce minimum interval between requests
+        if let Some(last_req) = self.last_request {
+            if let Ok(elapsed) = last_req.elapsed() {
+                if elapsed < self.min_interval {
+                    let wait_time = self.min_interval - elapsed;
+                    println!(
+                        "[RATE LIMIT] Minimum {} second interval",
+                        self.min_interval.as_secs()
+                    );
+                    thread::sleep(wait_time);
+                }
+            }
+        }
+
+        // Check TPM limit
+        let current_tpm = self.get_current_tpm();
+
+        // If we're at the limit, wait
+        if current_tpm >= self.max_tpm {
+            if let Some((oldest_time, _)) = self.token_usage.front() {
+                if let Ok(elapsed) = oldest_time.elapsed() {
+                    if elapsed < Duration::from_secs(60) {
+                        let wait_time =
+                            Duration::from_secs(60) - elapsed + Duration::from_millis(100);
+                        println!(
+                            "[TPM LIMIT] {}/{} tokens, waiting...",
+                            current_tpm, self.max_tpm
+                        );
+                        thread::sleep(wait_time);
+                    }
+                }
+            }
+        }
+
+        self.last_request = Some(now);
+    }
+}
+
+fn count_tokens(text: &str) -> u32 {
+    (text.len() / 4) as u32
+}
+
+fn filter_thinking_tokens(text: &str) -> String {
+    text.replace("<|start|>assistant<|channel|>", "")
+        .replace("<|message|>", "")
+        .replace("<|end|>", "")
+        .trim()
+        .to_string()
+}
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
+async fn main() {
     dotenv().ok();
 
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    println!("=== RUST CODE AGENT ===");
+    println!();
 
-    // Create app state
-    let mut app = AppState::default();
+    let instruction = env::var("INSTRUCTION").expect("Please set INSTRUCTION in .env");
+    let client = match AzureOpenAIClient::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: Failed to create AzureOpenAIClient: {}", e);
+            return;
+        }
+    };
 
-    let client = AzureOpenAIClient::new()
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to create AzureOpenAIClient: {}", e))?;
-
-    let prompt = fs::read_to_string("prompt.txt").unwrap_or_else(|_| {
-        "You are a helpful AI coding assistant.".to_string()
-    });
-
-    let project_root = env::var("PROJECT_PATH").unwrap_or_else(|_| ".".to_string());
+    let prompt = fs::read_to_string("prompt.txt").expect("Failed to read prompt.txt");
+    let project_root = env::var("PROJECT_PATH").expect("PROJECT_PATH not set");
 
     let tpm_limit: u32 = env::var("LLM_TPM")
         .unwrap_or_else(|_| "20000".to_string())
@@ -52,223 +137,453 @@ async fn main() -> Result<()> {
         .unwrap_or(20000);
 
     let min_interval_secs: u64 = env::var("LLM_MIN_INTERVAL")
-        .unwrap_or_else(|_| "10".to_string())
+        .unwrap_or_else(|_| "1".to_string())
         .parse()
-        .unwrap_or(10);
+        .unwrap_or(1);
 
     let mut tpm_limiter = TPMLimiter::new(tpm_limit, min_interval_secs);
-    app.stats.max_tpm = tpm_limit;
 
-    // Main loop
-    let result = run_app(
-        &mut terminal,
-        &mut app,
-        &client,
-        &prompt,
-        &project_root,
-        &mut tpm_limiter,
-    )
-    .await;
+    println!("Configuration:");
+    println!("- Project: {}", project_root);
+    println!("- Max TPM: {}", tpm_limit);
+    println!("- Min Interval: {}s", min_interval_secs);
+    println!();
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = result {
-        eprintln!("Error: {:?}", err);
-    }
-
-    Ok(())
-}
-
-async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut AppState,
-    client: &AzureOpenAIClient,
-    prompt: &str,
-    project_root: &str,
-    tpm_limiter: &mut TPMLimiter,
-) -> Result<()> {
-    // Start first iteration automatically
-    process_iteration(app, client, prompt, project_root, tpm_limiter).await?;
-
-    let mut last_update = std::time::Instant::now();
-    let spinner_frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut spinner_index = 0;
+    let mut iteration = 0;
+    let mut conversation_history: Vec<String> = Vec::new();
 
     loop {
-        terminal.draw(|f| draw_ui(f, app, &spinner_frames[spinner_index]))?;
+        iteration += 1;
+        println!("=== ITERATION {} ===", iteration);
 
-        // Update spinner every 80ms for fluid animation
-        if last_update.elapsed() > Duration::from_millis(80) {
-            spinner_index = (spinner_index + 1) % spinner_frames.len();
-            last_update = std::time::Instant::now();
-        }
+        let context = if conversation_history.is_empty() {
+            format!(
+                "{}\n\nProject: {}\nTask: {}\n\nNext step:",
+                prompt, project_root, instruction
+            )
+        } else {
+            format!(
+                "{}\n\nProject: {}\nTask: {}\n\nConversation History:\n{}\n\nNext step:",
+                prompt,
+                project_root,
+                instruction,
+                conversation_history.join("\n\n")
+            )
+        };
 
-        if app.should_quit {
-            break;
-        }
+        let input_tokens = count_tokens(&context);
+        println!("[REQUEST] Input tokens: {}", input_tokens);
 
-        if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            app.should_quit = true;
+        tpm_limiter.wait_if_needed();
+
+        println!("[LLM] Sending request...");
+        match client.generate(&context, &serde_json::json!({})).await {
+            Ok(resp) => {
+                let raw_response = resp.to_string();
+                let response = filter_thinking_tokens(&raw_response);
+                let output_tokens = count_tokens(&response);
+                let total_tokens = input_tokens + output_tokens;
+
+                tpm_limiter.add_token_usage(total_tokens);
+
+                println!(
+                    "[RESPONSE] Output tokens: {}, Total: {}",
+                    output_tokens, total_tokens
+                );
+                println!("[RAW RESPONSE] {}", raw_response);
+                println!("[FILTERED RESPONSE] {}", response);
+
+                conversation_history.push(format!("Assistant: {}", response));
+
+                let tools = extract_tools(&response);
+                println!("[TOOLS] Found {} tools", tools.len());
+
+                if tools.is_empty() {
+                    println!("[WARNING] No tools found in response!");
+                    println!("Response was: {}", response);
+                    println!("Continue? (y/n): ");
+                    io::stdout().flush().ok();
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input).unwrap();
+                    if input.trim() != "y" {
+                        break;
+                    }
+                    continue;
+                }
+
+                let mut all_results = Vec::new();
+
+                for (i, (tool, param)) in tools.iter().enumerate() {
+                    println!(
+                        "[EXECUTE] Tool {}/{}: {} -> {}",
+                        i + 1,
+                        tools.len(),
+                        tool,
+                        param
+                    );
+
+                    let result = execute_tool(tool, param, &project_root);
+                    println!("[RESULT] {}", result);
+
+                    all_results.push(format!("Tool: {}\nResult:\n{}", tool, result));
+
+                    if tool == "execute_command" && param.contains("cargo run") {
+                        if result.contains("exit_code: 0")
+                            && !result.contains("error:")
+                            && !result.contains("Error")
+                        {
+                            println!("[SUCCESS] Task completed!");
+                            return;
                         }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.should_quit = true;
-                        }
-                        KeyCode::Enter => {
-                            if !app.chat_input.trim().is_empty() && !app.processing {
-                                let user_message = app.chat_input.clone();
-                                app.chat_input.clear();
-                                app.conversation_history
-                                    .push(format!("User: {}", user_message));
-                                app.processing = true;
-                                process_iteration(app, client, prompt, project_root, tpm_limiter)
-                                    .await?;
-                                app.processing = false;
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            if !app.processing {
-                                app.chat_input.push(c);
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            if !app.processing {
-                                app.chat_input.pop();
-                            }
-                        }
-                        KeyCode::Up => {
-                            if app.thoughts_scroll > 0 {
-                                app.thoughts_scroll = app.thoughts_scroll.saturating_sub(1);
-                            }
-                        }
-                        KeyCode::Down => {
-                            let max_scroll = app.current_thoughts.lines().count().saturating_sub(10);
-                            if app.thoughts_scroll < max_scroll as u32 {
-                                app.thoughts_scroll += 1;
-                            }
-                        }
-                        KeyCode::PageUp => {
-                            app.thoughts_scroll = app.thoughts_scroll.saturating_sub(5);
-                        }
-                        KeyCode::PageDown => {
-                            let max_scroll = app.current_thoughts.lines().count().saturating_sub(10);
-                            app.thoughts_scroll = (app.thoughts_scroll + 5).min(max_scroll as u32);
-                        }
-                        _ => {}
                     }
                 }
-                _ => {}
+
+                conversation_history.push(format!("Tool Results:\n{}", all_results.join("\n\n")));
+
+                if conversation_history.len() > 20 {
+                    conversation_history.drain(0..10);
+                }
+
+                println!();
+            }
+            Err(err) => {
+                eprintln!("[ERROR] LLM request failed: {}", err);
+                println!("Continue? (y/n): ");
+                io::stdout().flush().ok();
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap();
+                if input.trim() != "y" {
+                    break;
+                }
             }
         }
     }
-
-    Ok(())
 }
 
-async fn process_iteration(
-    app: &mut AppState,
-    client: &AzureOpenAIClient,
-    prompt: &str,
-    project_root: &str,
-    tpm_limiter: &mut TPMLimiter,
-) -> Result<()> {
-    app.iteration += 1;
-    app.current_tools.clear();
+fn extract_tools(text: &str) -> Vec<(String, String)> {
+    println!("[DEBUG] === TOOL EXTRACTION START ===");
+    println!("[DEBUG] Input text length: {} chars", text.len());
 
-    let context = if app.conversation_history.is_empty() {
-        format!("{}\n\nProject: {}\n\nConversation:", prompt, project_root)
-    } else {
-        format!(
-            "{}\n\nProject: {}\n\nConversation History:\n{}\n\nNext:",
-            prompt,
-            project_root,
-            app.conversation_history.join("\n\n")
-        )
-    };
+    let cleaned_text = text
+        .replace("```rust", "")
+        .replace("```sh", "")
+        .replace("```bash", "")
+        .replace("```", "");
+    let text = cleaned_text.as_str();
 
-    app.stats.input_tokens = app::count_tokens(&context);
-    app.current_thoughts = "🤔 Thinking...".to_string();
+    let mut tools = Vec::new();
 
-    // Rate limiting
-    tpm_limiter.wait_if_needed();
-    app.stats.current_tpm = tpm_limiter.get_current_tpm();
+    // First priority: Extract delta format (file changes)
+    let delta_tools = extract_delta_format(text);
+    tools.extend(delta_tools);
 
-    // LLM Request
-    match client.generate(&context, &serde_json::json!({})).await {
-        Ok(resp) => {
-            let raw_response = resp;
-            let response = app::filter_thinking_tokens(&raw_response);
-            app.current_thoughts = response.clone();
+    // If we found delta tools, return them immediately (most common case)
+    if !tools.is_empty() {
+        println!(
+            "[DEBUG] Found {} delta tools, skipping other extraction",
+            tools.len()
+        );
+        return tools;
+    }
 
-            let output_tokens = app::count_tokens(&response);
-            let total_tokens = app.stats.input_tokens + output_tokens;
+    // Second: Look for simple tool patterns
+    let simple_tools = extract_simple_tools(text);
+    tools.extend(simple_tools);
 
-            tpm_limiter.add_token_usage(total_tokens);
-            app.stats.output_tokens = output_tokens;
-            app.stats.total_tokens = tpm_limiter.get_total_tokens();
-            app.stats.current_tpm = tpm_limiter.get_current_tpm();
+    println!("[DEBUG] === TOOL EXTRACTION COMPLETE ===");
+    println!("[DEBUG] Found {} unique tools:", tools.len());
+    for (i, (tool, param)) in tools.iter().enumerate() {
+        println!(
+            "[DEBUG]   {}. {}: '{}'",
+            i + 1,
+            tool,
+            if param.len() > 50 {
+                format!("{}...", &param[..47])
+            } else {
+                param.to_string()
+            }
+        );
+    }
 
-            app.conversation_history
-                .push(format!("Assistant: {}", response));
+    tools
+}
+fn extract_delta_format(text: &str) -> Vec<(String, String)> {
+    println!("[DELTA] === DELTA EXTRACTION START ===");
+    let mut tools = Vec::new();
 
-            let tools = app::extract_tools(&response);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
 
-            // Execute tools
-            for (tool, param) in tools {
-                let result = app::execute_tool(&tool, &param, project_root);
-                app.current_tools
-                    .push((tool.clone(), param.clone(), result.clone()));
+    while i < lines.len() {
+        let line = lines[i].trim();
 
-                // Check for success condition
-                if tool == "execute_command" && param.contains("cargo run") {
-                    if result.contains("exit_code: 0") && !result.to_lowercase().contains("error") {
-                        app.success_achieved = true;
-                    }
-                }
+        if line.starts_with("CHANGE:") {
+            println!("[DELTA] Found CHANGE at line {}: {}", i, line);
+
+            let file_path = line.replace("CHANGE:", "").trim().to_string();
+            let mut current_content = String::new();
+            let mut new_content = String::new();
+
+            i += 1; // Move to next line
+
+            // Look for <<<<<<< CURRENT
+            while i < lines.len() && !lines[i].trim().starts_with("<<<<<<< CURRENT") {
+                i += 1;
             }
 
-            if !app.current_tools.is_empty() {
-                let tool_summary: Vec<String> = app
-                    .current_tools
-                    .iter()
-                    .map(|(t, p, r)| {
-                        format!(
-                            "{}: {} -> {}",
-                            t,
-                            if p.len() > 30 {
-                                format!("{}...", &p[..30])
-                            } else {
-                                p.clone()
-                            },
-                            if r.len() > 50 {
-                                format!("{}...", &r[..50])
-                            } else {
-                                r.clone()
-                            }
-                        )
-                    })
-                    .collect();
-
-                app.conversation_history
-                    .push(format!("Tool Results:\n{}", tool_summary.join("\n")));
+            if i >= lines.len() {
+                println!("[DELTA] ERROR: No <<<<<<< CURRENT found after CHANGE");
+                break;
             }
 
-            // Keep only last 10 conversation items
-            if app.conversation_history.len() > 10 {
-                app.conversation_history
-                    .drain(0..app.conversation_history.len() - 10);
+            i += 1; // Skip <<<<<<< CURRENT line
+
+            // Collect CURRENT content until =======
+            while i < lines.len() && !lines[i].trim().starts_with("=======") {
+                current_content.push_str(lines[i]);
+                current_content.push_str("\n");
+                i += 1;
             }
-        }
-        Err(err) => {
-            app.current_thoughts = format!("❌ Error: {}", err);
+
+            if i >= lines.len() {
+                println!("[DELTA] ERROR: No ======= found after CURRENT section");
+                break;
+            }
+
+            i += 1; // Skip ======= line
+
+            // Collect NEW content until >>>>>>> NEW
+            while i < lines.len() && !lines[i].trim().starts_with(">>>>>>> NEW") {
+                new_content.push_str(lines[i]);
+                new_content.push_str("\n");
+                i += 1;
+            }
+
+            if i >= lines.len() {
+                println!("[DELTA] ERROR: No >>>>>>> NEW found after NEW section");
+                break;
+            }
+
+            i += 1; // Skip >>>>>>> NEW line
+
+            // Trim the content to handle whitespace issues
+            let current_trimmed = current_content.trim();
+            let new_trimmed = new_content.trim();
+
+            println!("[DELTA] Extracted delta for file: {}", file_path);
+            println!(
+                "[DELTA] Current content length: {} -> {}",
+                current_content.len(),
+                current_trimmed.len()
+            );
+            println!(
+                "[DELTA] New content length: {} -> {}",
+                new_content.len(),
+                new_trimmed.len()
+            );
+
+            // Create the tool call
+            let tool_param = format!("{}:::{}\n{}", file_path, current_trimmed, new_trimmed);
+
+            tools.push(("write_file_delta".to_string(), tool_param));
+        } else {
+            i += 1;
         }
     }
 
-    Ok(())
+    println!("[DELTA] === DELTA EXTRACTION COMPLETE ===");
+    println!("[DELTA] Found {} delta changes", tools.len());
+    tools
+}
+fn extract_simple_tools(text: &str) -> Vec<(String, String)> {
+    println!("[SIMPLE] === SIMPLE TOOL EXTRACTION START ===");
+    let mut tools = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Skip delta format lines
+        if line.starts_with("CHANGE:")
+            || line.starts_with("<<<<<<<")
+            || line.starts_with("=======")
+            || line.starts_with(">>>>>>>")
+        {
+            continue;
+        }
+
+        println!("[SIMPLE] Processing line: '{}'", line);
+
+        // read_file patterns
+        if line.contains("read_file") {
+            // read_file("path")
+            if let Some(start) = line.find("read_file(") {
+                if let Some(end) = line[start..].find(')') {
+                    let param = line[start + 10..start + end]
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+                    if !param.is_empty() {
+                        println!("[SIMPLE] Found read_file: '{}'", param);
+                        tools.push(("read_file".to_string(), param));
+                        continue;
+                    }
+                }
+            }
+            // read_file: "path"
+            if let Some(start) = line.find("read_file:") {
+                let after = line[start + 10..].trim();
+                if let Some(param) = extract_between_quotes(after) {
+                    println!("[SIMPLE] Found read_file: '{}'", param);
+                    tools.push(("read_file".to_string(), param));
+                    continue;
+                }
+            }
+        }
+
+        // execute_command patterns
+        if line.contains("execute_command") {
+            // execute_command("cmd")
+            if let Some(start) = line.find("execute_command(") {
+                let after = line[start + 16..].trim();
+                if let Some(end) = after.find(')') {
+                    let content = &after[..end];
+                    if let Some(param) = extract_between_quotes(content) {
+                        println!("[SIMPLE] Found execute_command: '{}'", param);
+                        tools.push(("execute_command".to_string(), param));
+                        continue;
+                    }
+                }
+            }
+            // execute_command: "cmd"
+            if let Some(start) = line.find("execute_command:") {
+                let after = line[start + 16..].trim();
+                if let Some(param) = extract_between_quotes(after) {
+                    println!("[SIMPLE] Found execute_command: '{}'", param);
+                    tools.push(("execute_command".to_string(), param));
+                    continue;
+                }
+            }
+            // OSS GPT weird format
+            if line.contains("code{\"command\":\"") {
+                if let Some(start) = line.find("code{\"command\":\"") {
+                    let after = line[start + 16..].trim();
+                    if let Some(end) = after.find('"') {
+                        let param = &after[..end];
+                        println!("[SIMPLE] Found OSS GPT command: '{}'", param);
+                        tools.push(("execute_command".to_string(), param.to_string()));
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    println!("[SIMPLE] === SIMPLE TOOL EXTRACTION COMPLETE ===");
+    println!("[SIMPLE] Found {} simple tools", tools.len());
+    tools
+}
+
+fn extract_between_quotes(text: &str) -> Option<String> {
+    let text = text.trim();
+
+    if text.starts_with('"') {
+        if let Some(end) = text[1..].find('"') {
+            return Some(text[1..1 + end].to_string());
+        }
+    } else if text.starts_with('\'') {
+        if let Some(end) = text[1..].find('\'') {
+            return Some(text[1..1 + end].to_string());
+        }
+    }
+
+    None
+}
+
+fn execute_tool(tool: &str, param: &str, root: &str) -> String {
+    match tool {
+        "read_file" => {
+            let path = Path::new(root).join(param);
+            println!("[EXECUTE] Reading file: {}", path.display());
+            fs::read_to_string(&path).unwrap_or_else(|e| format!("Error: {}", e))
+        }
+        "write_file_delta" => {
+            println!("[EXECUTE] Writing file delta: {}", param);
+            let parts: Vec<&str> = param.splitn(2, ":::").collect();
+            if parts.len() == 2 {
+                let path = Path::new(root).join(parts[0]);
+                let content_parts: Vec<&str> = parts[1].splitn(2, '\n').collect();
+                if content_parts.len() == 2 {
+                    let old_content = content_parts[0].trim();
+                    let new_content = content_parts[1].trim();
+                    apply_delta(&path, old_content, new_content)
+                } else {
+                    "Error: Invalid delta format".to_string()
+                }
+            } else {
+                "Error: Invalid write_file_delta format".to_string()
+            }
+        }
+        "execute_command" => {
+            println!("[EXECUTE] Running command: {}", param);
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(param)
+                .current_dir(root)
+                .output()
+                .unwrap();
+
+            format!(
+                "stdout:\n{}\nstderr:\n{}\nexit_code: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                output.status.code().unwrap_or(-1)
+            )
+        }
+        _ => {
+            println!("[ERROR] Unknown tool: {}", tool);
+            String::new()
+        }
+    }
+}
+
+fn apply_delta(path: &Path, old_content: &str, new_content: &str) -> String {
+    let existing_content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            return match fs::write(path, new_content) {
+                Ok(_) => format!("Created new file {}", path.display()),
+                Err(e) => format!("Error creating file: {}", e),
+            };
+        }
+    };
+
+    if old_content.is_empty() {
+        return match fs::write(path, new_content) {
+            Ok(_) => format!("Replaced entire file {}", path.display()),
+            Err(e) => format!("Error writing file: {}", e),
+        };
+    }
+
+    if let Some(pos) = existing_content.find(old_content) {
+        let mut new_file_content = String::new();
+        new_file_content.push_str(&existing_content[..pos]);
+        new_file_content.push_str(new_content);
+        new_file_content.push_str(&existing_content[pos + old_content.len()..]);
+
+        match fs::write(path, new_file_content) {
+            Ok(_) => format!("Applied delta to {}", path.display()),
+            Err(e) => format!("Error applying delta: {}", e),
+        }
+    } else {
+        format!(
+            "Error: Could not find the specified content in {}",
+            path.display()
+        )
+    }
 }

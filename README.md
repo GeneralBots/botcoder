@@ -1,86 +1,59 @@
-# 🤖 BotCoder - AI Coding Agent
+# 🤖 General Bots Coder
 
-A beautiful, terminal-based AI coding agent with a modern dark theme UI.
+Terminal-based AI coding agent with real-time streaming and COMPLETE tool output (no truncation!)
 
-## Features
+## ✨ Key Features
 
-- 🎨 Modern, fluid terminal UI with smooth animations
-- 💬 Interactive chat interface
-- 🛠️ Automated tool execution (file reading, writing, command execution)
-- 📊 Real-time token usage statistics
-- ⚡ Built-in TPM (Tokens Per Minute) rate limiting
-- 🎯 Success detection for task completion
+- 🌊 **Real-time Streaming** - Watch AI responses appear live
+- 📜 **Full Output Scrolling** - See EVERY line of tool output, scroll forever
+- 🎨 **Animated Gradients** - Fluid UI animations
+- 🛠️ **Tool Execution** - Reads files, executes commands, modifies code
+- 📊 **Live Statistics** - Real-time token usage
+- ⚡ **Non-blocking** - Smooth, responsive UI
 
-## Setup
+## 🚀 Quick Start
 
-1. Copy `.env.example` to `.env`:
-   ```bash
-   cp .env.example .env
-   ```
+```bash
+bash restore.sh
+cd botcoder
+cp .env.example .env
+# Edit .env with your Azure OpenAI credentials
+cargo run
+```
 
-2. Configure your environment variables in `.env`:
-   - `LLM_URL`: Your Azure OpenAI endpoint
-   - `LLM_KEY`: Your API key
-   - `LLM_MODEL`: Model deployment name
-   - `PROJECT_PATH`: Path to the project you want to work on
+## ⌨️ Controls
 
-3. Build and run:
-   ```bash
-   cargo build --release
-   cargo run
-   ```
+- **Enter**: Send message (streams response!)
+- **↑ / ↓ / PgUp / PgDn**: Scroll AI output panel
+- **W / S**: Scroll tools panel
+- **Q / ESC / Ctrl+C**: Quit
 
-## Usage
+## 🎨 UI Layout
 
-### Keyboard Controls
+```
+┌─────────────────────────────────────────────┐
+│  Header: Status, Iteration, Streaming      │
+├──────────────┬──────────────┬───────────────┤
+│  AI Output   │  Tool Output │  Statistics   │
+│  (50%)       │  (30%)       │  (20%)        │
+│  FULL TEXT   │  NO TRUNCATE │  Tokens, TPM  │
+│  Scrollable  │  Scrollable  │  Animated     │
+├──────────────────────────────────────────────┤
+│  Chat Input                                 │
+├──────────────────────────────────────────────┤
+│  Footer: Controls                           │
+└──────────────────────────────────────────────┘
+```
 
-- **Enter**: Send message to AI
-- **Q / ESC / Ctrl+C**: Quit application
-- **↑ / ↓**: Scroll through AI thoughts
-- **PgUp / PgDn**: Fast scroll
-- **Type**: Enter your message
+## 💡 Features
 
-### Tool Commands
+- **NO TRUNCATION**: All tool output shown in full
+- **Infinite Scrolling**: Scroll through thousands of lines
+- **Live Streaming**: Text appears character-by-character
+- **Tool Detection**: Automatically extracts and executes tools
+- **Color Coding**: ✓ success (green), ✗ errors (red), tools (yellow)
+- **Line Counts**: Shows total lines in each panel
 
-The AI can use the following tools:
-
-1. **Read files**:
-   ```
-   read_file("path/to/file")
-   ```
-
-2. **Execute commands**:
-   ```
-   execute_command("cargo build")
-   ```
-
-3. **Modify files**:
-   ```
-   CHANGE: path/to/file
-   <<<<<<< CURRENT
-   old content
-   =======
-   new content
-   >>>>>>> NEW
-   ```
-
-## Configuration
-
-Edit `prompt.txt` to customize the AI's behavior and instructions.
-
-## Architecture
-
-- **main.rs**: Application entry point and event loop
-- **app.rs**: Application state and tool execution logic
-- **llm.rs**: Azure OpenAI client with rate limiting
-- **tpm_limiter.rs**: Token-per-minute rate limiter
-- **ui.rs**: Terminal UI rendering with Ratatui
-
-## Requirements
-
-- Rust 1.70+
-- Azure OpenAI API access (or compatible endpoint)
-
-## License
+## 📝 License
 
 MIT
